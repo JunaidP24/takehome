@@ -122,21 +122,48 @@ class ECFRService:
             raise Exception(f"Failed to fetch title versions: {str(e)}")
 
     def get_title_corrections(self, title_number):
-        """Get corrections for a specific title"""
+        """Get corrections for a specific title using the corrections API endpoint"""
         try:
-            response = self.session.get(f"{self.BASE_URL}/admin/v1/corrections/title/{title_number}.json")
-            response.raise_for_status()
-            return response.json()
-        except requests.exceptions.RequestException as e:
-            print(f"Error fetching title corrections: {str(e)}")
-            raise Exception(f"Failed to fetch title corrections: {str(e)}")
+            print(f"\nFetching corrections for title {title_number}")
+            url = f"{self.BASE_URL}/admin/v1/corrections/title/{title_number}.json"
+            response = self.session.get(url)
+            
+            if not response.ok:
+                print(f"Failed to get corrections: {response.status_code}")
+                return []
+            
+            data = response.json()
+            corrections = data.get('ecfr_corrections', [])
+            
+            # Sort corrections by error_corrected date, most recent first
+            corrections.sort(key=lambda x: x.get('error_corrected', ''), reverse=True)
+            
+            # Format corrections for frontend
+            formatted_corrections = [
+                {
+                    'correction_date': correction.get('error_corrected'),
+                    'correction_text': f"{correction.get('corrective_action')} - {correction.get('cfr_references', [{}])[0].get('cfr_reference', '')}",
+                    'fr_citation': correction.get('fr_citation'),
+                    'error_occurred': correction.get('error_occurred')
+                }
+                for correction in corrections
+            ]
+            
+            print(f"Found {len(formatted_corrections)} corrections")
+            return formatted_corrections
+
+        except Exception as e:
+            print(f"Error getting corrections: {str(e)}")
+            print("Traceback:", traceback.format_exc())
+            return []
 
     def get_full_title_content(self, title_number):
-        """Fetch and parse full XML content for a title"""
+        """Fetch and parse full content for a title"""
         try:
-            # Get the latest issue date
+            # Get the latest date first
             titles_response = self.session.get(f"{self.BASE_URL}/versioner/v1/titles.json")
             if not titles_response.ok:
+                print(f"Failed to get titles data: {titles_response.status_code}")
                 return ''
 
             titles_data = titles_response.json()
@@ -146,157 +173,260 @@ class ECFRService:
             )
             
             if not title_info or not title_info.get('latest_issue_date'):
+                print("No title info or latest date found")
                 return ''
 
             latest_date = title_info['latest_issue_date']
             
-            # Try different content endpoints
-            endpoints = [
-                f"{self.BASE_URL}/versioner/v1/full/{latest_date}/title-{title_number}/title-{title_number}.xml",
-                f"{self.BASE_URL}/versioner/v1/full/{latest_date}/title-{title_number}.xml",
-                f"{self.BASE_URL}/versioner/v1/structure/{latest_date}/title-{title_number}.json"
-            ]
+            # Try to get the full content
+            content_url = f"{self.BASE_URL}/versioner/v1/structure/{latest_date}/title-{title_number}.json"
+            print(f"Fetching content from: {content_url}")
+            
+            response = self.session.get(content_url)
+            if not response.ok:
+                print(f"Failed to get content: {response.status_code}")
+                return ''
 
-            content_text = ''
-            for endpoint in endpoints:
-                try:
-                    print(f"Trying endpoint: {endpoint}")
-                    response = self.session.get(endpoint)
-                    if response.ok:
-                        if endpoint.endswith('.xml'):
-                            # Parse XML content
-                            soup = BeautifulSoup(response.content, 'xml')
-                            # Extract text from all content tags
-                            content_tags = soup.find_all(['content', 'title', 'subject', 'text'])
-                            content_text = ' '.join(tag.get_text() for tag in content_tags)
-                            break
-                        elif endpoint.endswith('.json'):
-                            # Parse JSON structure
-                            data = response.json()
-                            content_text = self.extract_text_from_structure(data)
-                            break
-                except Exception as e:
-                    print(f"Error with endpoint {endpoint}: {str(e)}")
-                    continue
+            structure_data = response.json()
+            
+            # Extract text from the structure recursively
+            def extract_text(node):
+                text = []
+                # Get text from label and text fields
+                if isinstance(node, dict):
+                    text.extend([
+                        str(node.get('label', '')),
+                        str(node.get('label_description', '')),
+                        str(node.get('text', '')),
+                        str(node.get('content', ''))
+                    ])
+                    # Recursively process children
+                    for child in node.get('children', []):
+                        text.extend(extract_text(child))
+                return text
 
+            # Extract all text from the structure
+            all_text = extract_text(structure_data)
+            content = ' '.join(filter(None, all_text))  # Join non-empty strings
+            
             # Clean up the text
-            content_text = re.sub(r'\s+', ' ', content_text)  # Replace multiple spaces
-            content_text = re.sub(r'[^\w\s]', ' ', content_text)  # Remove punctuation
-            return content_text.strip()
+            content = re.sub(r'\s+', ' ', content)  # Replace multiple spaces with single space
+            content = re.sub(r'[^\w\s]', ' ', content)  # Remove punctuation
+            content = content.strip()
+            
+            print(f"Extracted {len(content.split())} words from title {title_number}")
+            return content
 
         except Exception as e:
-            print(f"Error fetching full title content: {str(e)}")
+            print(f"Error getting full content for title {title_number}: {str(e)}")
             print("Traceback:", traceback.format_exc())
             return ''
 
-    def extract_text_from_structure(self, data):
-        """Recursively extract text from structure data"""
-        text_content = []
-        
-        def extract_text(node):
-            if isinstance(node, dict):
-                # Extract text from relevant fields
-                text_fields = ['label_description', 'subject', 'text', 'title', 'content']
-                for field in text_fields:
-                    if field in node:
-                        text_content.append(str(node[field]))
-                
-                # Recursively process children
-                if 'children' in node:
-                    for child in node['children']:
-                        extract_text(child)
-            elif isinstance(node, list):
-                for item in node:
-                    extract_text(item)
-
-        extract_text(data)
-        return ' '.join(text_content)
-
-    def get_agency_word_counts(self, title_number, content):
-        """Analyze word count by agency"""
+    def get_agencies(self):
+        """Fetch the list of agencies from the eCFR API"""
         try:
-            # Get structure to identify agencies/parts
-            structure = self.get_title_structure(title_number)
-            if not structure or 'parts' not in structure:
+            response = self.session.get(f"{self.BASE_URL}/admin/v1/agencies.json")
+            if not response.ok:
+                print(f"Failed to get agencies: {response.status_code}")
                 return {}
 
-            agency_counts = defaultdict(int)
-            
-            # Count words for each part
-            for part in structure['parts']:
-                part_name = part.get('name', '')
-                if part_name:
-                    # Use regex to find words in the content that appear near the part name
-                    context_window = 1000  # Characters to look before/after part name
-                    part_pattern = re.escape(part_name)
-                    matches = re.finditer(part_pattern, content)
-                    
-                    for match in matches:
-                        start = max(0, match.start() - context_window)
-                        end = min(len(content), match.end() + context_window)
-                        context = content[start:end]
-                        words = len(re.findall(r'\w+', context))
-                        agency_counts[part_name] += words
+            data = response.json()
+            agency_map = {}
 
-            return dict(agency_counts)
+            def process_agency(agency):
+                # Add the main agency
+                variations = [
+                    agency['name'],
+                    agency['short_name'],
+                    agency['display_name']
+                ]
+                agency_map[agency['short_name']] = {
+                    'variations': variations,
+                    'name': agency['display_name'],
+                    'cfr_references': agency.get('cfr_references', [])
+                }
+                
+                # Process children recursively
+                for child in agency.get('children', []):
+                    process_agency(child)
+
+            for agency in data.get('agencies', []):
+                process_agency(agency)
+
+            return agency_map
 
         except Exception as e:
-            print(f"Error analyzing agency word counts: {str(e)}")
+            print(f"Error fetching agencies: {str(e)}")
+            print("Traceback:", traceback.format_exc())
             return {}
 
-    def get_historical_changes(self, title_number):
-        """Get historical changes for a title over the past year"""
+    def get_agency_word_counts(self, title_number, content):
+        """Calculate word counts per agency mentioned in the content"""
         try:
-            # Get the latest issue date from titles endpoint
-            titles_response = self.session.get(f"{self.BASE_URL}/versioner/v1/titles.json")
-            if not titles_response.ok:
-                return []
-
-            titles_data = titles_response.json()
-            title_info = next(
-                (t for t in titles_data.get('titles', []) if t.get('number') == int(title_number)),
-                None
-            )
-
-            if not title_info or not title_info.get('latest_issue_date'):
-                return []
-
-            # Start from latest date and work backwards
-            latest_date = datetime.strptime(title_info['latest_issue_date'], '%Y-%m-%d').date()
-            start_date = latest_date - timedelta(days=365)
-            changes = []
+            print(f"\nFetching agencies for title {title_number}")
+            agencies = self.get_agencies()
             
-            current_date = latest_date
-            while current_date >= start_date:
-                date_str = current_date.strftime("%Y-%m-%d")
-                try:
-                    response = self.session.get(
-                        f"{self.BASE_URL}/versioner/v1/structure/{date_str}/title-{title_number}.json"
-                    )
-                    if response.ok:
-                        structure_data = response.json()
-                        # Parse the structure data
-                        parsed_structure = self.parse_structure(structure_data)
-                        changes.append({
-                            'date': date_str,
-                            'total_parts': parsed_structure['total_parts'],
-                            'total_sections': parsed_structure['total_sections']
-                        })
-                        print(f"Got data for {date_str}: {parsed_structure['total_sections']} sections")
-                except Exception as e:
-                    print(f"Error fetching historical data for {date_str}: {str(e)}")
+            if not content or not agencies:
+                print("No content or agencies found")
+                return {}
+
+            # Filter agencies to those that have references to this title
+            relevant_agencies = {
+                short_name: data
+                for short_name, data in agencies.items()
+                if any(ref.get('title') == int(title_number) 
+                      for ref in data['cfr_references'])
+            }
+            print(f"Found {len(relevant_agencies)} agencies relevant to title {title_number}")
+
+            # Initialize counters
+            agency_mentions = {}    # Count of mentions per agency
+            agency_word_counts = {} # Final word counts per agency
+            
+            # Split content into sections
+            sections = re.split(r'(?=\n*§\s*\d+\.)', content)
+            print(f"Processing {len(sections)} sections")
+            
+            total_words = len(re.findall(r'\b\w+\b', content))
+            print(f"Total words in content: {total_words}")
+            
+            for i, section in enumerate(sections):
+                if not section.strip():
+                    continue
+                    
+                section_words = len(re.findall(r'\b\w+\b', section))
+                if section_words == 0:
+                    continue
+                    
+                print(f"\nProcessing section {i} with {section_words} words")
                 
-                # Move back 30 days
-                current_date -= timedelta(days=30)
+                # Count mentions for each agency in this section
+                section_mentions = {}
+                for short_name, data in relevant_agencies.items():
+                    mention_count = 0
+                    for variation in data['variations']:
+                        if not variation:
+                            continue
+                        pattern = r'\b' + re.escape(variation) + r'\b'
+                        matches = len(re.findall(pattern, section, re.IGNORECASE))
+                        mention_count += matches
+                    
+                    if mention_count > 0:
+                        section_mentions[short_name] = mention_count
+                        agency_mentions[short_name] = agency_mentions.get(short_name, 0) + mention_count
+                        print(f"Found {mention_count} mentions of {short_name} in section {i}")
+                
+                # Distribute section words based on mention counts
+                if section_mentions:
+                    total_section_mentions = sum(section_mentions.values())
+                    for agency, mentions in section_mentions.items():
+                        # Words attributed to this agency = (agency mentions / total mentions) * section words
+                        agency_words = (mentions / total_section_mentions) * section_words
+                        agency_word_counts[agency] = agency_word_counts.get(agency, 0) + agency_words
+
+            # Calculate final counts
+            final_counts = {}
+            total_mentions = sum(agency_mentions.values())
             
-            # Sort changes by date
-            changes.sort(key=lambda x: x['date'])
-            return changes
+            for agency, mentions in agency_mentions.items():
+                if mentions > 0:
+                    # Calculate word count proportional to mentions
+                    word_count = agency_word_counts.get(agency, 0)
+                    final_counts[agencies[agency]['name']] = round(word_count)
+                    print(f"{agencies[agency]['name']}: {mentions} mentions, {round(word_count)} words")
+
+            print("\nFinal agency word counts:")
+            for agency, count in sorted(final_counts.items(), key=lambda x: x[1], reverse=True):
+                print(f"{agency}: {count} words ({agency_mentions.get(agency, 0)} mentions)")
+            
+            return final_counts
 
         except Exception as e:
-            print(f"Error fetching historical changes: {str(e)}")
+            print(f"Error calculating agency word counts: {str(e)}")
             print("Traceback:", traceback.format_exc())
-            return []
+            return {}
+
+    def get_historical_changes(self, title_number, months=60):
+        """Get historical changes in section and part counts"""
+        try:
+            print(f"\nGetting historical data for title {title_number}")
+            
+            # First get all available versions for this title
+            versions_url = f"{self.BASE_URL}/versioner/v1/titles.json"
+            versions_response = self.session.get(versions_url)
+            if not versions_response.ok:
+                print(f"Failed to get versions: {versions_response.status_code}")
+                return {'dates': [], 'section_counts': [], 'part_counts': []}
+            
+            versions_data = versions_response.json()
+            
+            # Find the title's version history
+            title_info = next(
+                (t for t in versions_data.get('titles', []) 
+                 if t.get('number') == int(title_number)),
+                None
+            )
+            
+            if not title_info:
+                print(f"No version history found for title {title_number}")
+                return {'dates': [], 'section_counts': [], 'part_counts': []}
+            
+            # Get the version dates from the title info
+            cutoff_date = (datetime.now() - timedelta(days=30 * months)).strftime('%Y-%m-%d')
+            relevant_dates = [
+                date for date in title_info.get('version_dates', [])
+                if date >= cutoff_date
+            ]
+            
+            print(f"Found {len(relevant_dates)} versions since {cutoff_date}")
+            
+            historical_data = []
+            for date in relevant_dates:
+                try:
+                    print(f"Fetching data for {date}")
+                    url = f"{self.BASE_URL}/versioner/v1/structure/{date}/title-{title_number}.json"
+                    response = self.session.get(url)
+                    
+                    if response.ok:
+                        data = response.json()
+                        section_count = self.count_sections(data)
+                        part_count = self.count_parts(data)
+                        print(f"Got data for {date}: {section_count} sections, {part_count} parts")
+                        
+                        historical_data.append({
+                            'date': date,
+                            'total_sections': section_count,
+                            'total_parts': part_count
+                        })
+                    else:
+                        print(f"Failed to get data for {date}: {response.status_code}")
+                except Exception as e:
+                    print(f"Error processing date {date}: {str(e)}")
+                    continue
+
+            # Sort by date
+            historical_data.sort(key=lambda x: x['date'])
+            
+            # Extract the data into separate lists
+            dates = [item['date'] for item in historical_data]
+            section_counts = [item['total_sections'] for item in historical_data]
+            part_counts = [item['total_parts'] for item in historical_data]
+
+            print(f"Collected {len(historical_data)} historical data points")
+            return {
+                'dates': dates,
+                'section_counts': section_counts,
+                'part_counts': part_counts
+            }
+
+        except Exception as e:
+            print(f"Error getting historical changes: {str(e)}")
+            print("Traceback:", traceback.format_exc())
+            return {
+                'dates': [],
+                'section_counts': [],
+                'part_counts': []
+            }
 
     def get_latest_update_date(self, title_number):
         """Get the actual latest update date for a title"""
@@ -338,11 +468,24 @@ class ECFRService:
                 print("Failed to get title structure")
                 raise Exception("Could not fetch title structure")
 
+            # Get full content and calculate metrics
+            content = self.get_full_title_content(title_number)
+            word_count = len(re.findall(r'\b\w+\b', content)) if content else 0
+            total_sections = structure['total_sections'] or 1
+            avg_words_per_section = round(word_count / total_sections, 2)
+            
+            # Calculate agency-specific word counts
+            print("\nCalculating agency word counts...")
+            agency_counts = self.get_agency_word_counts(title_number, content)
+            print(f"Found word counts for {len(agency_counts)} agencies")
+            
+            print(f"Word count: {word_count}")
+            print(f"Total sections: {total_sections}")
+            print(f"Average words per section: {avg_words_per_section}")
+            print(f"Agency word counts: {agency_counts}")
+
             versions = self.get_title_versions(title_number)
             corrections = self.get_title_corrections(title_number)
-            content = self.get_full_title_content(title_number)
-            word_count = len(re.findall(r'\w+', content)) if content else 0
-            agency_counts = self.get_agency_word_counts(title_number, content)
             historical_data = self.get_historical_changes(title_number)
 
             analysis = {
@@ -355,16 +498,16 @@ class ECFRService:
                 },
                 'metrics': {
                     'word_count': word_count,
-                    'average_words_per_section': round(word_count / (structure['total_sections'] or 1), 2),
+                    'average_words_per_section': avg_words_per_section,
                     'agency_word_counts': agency_counts
                 },
                 'historical_data': {
-                    'section_counts': [change['total_sections'] for change in historical_data],
-                    'dates': [change['date'] for change in historical_data],
-                    'part_counts': [change['total_parts'] for change in historical_data]
+                    'section_counts': historical_data['section_counts'],
+                    'dates': historical_data['dates'],
+                    'part_counts': historical_data['part_counts']
                 },
                 'versions': {
-                    'total_versions': len(historical_data),
+                    'total_versions': len(historical_data['dates']),
                     'latest_update': latest_date
                 },
                 'corrections': {
@@ -379,8 +522,6 @@ class ECFRService:
                 }
             }
             
-            print(f"Analysis complete for title {title_number}")
-            print(f"Latest update date: {latest_date}")
             return analysis
             
         except Exception as e:
@@ -413,4 +554,36 @@ class ECFRService:
                     'recent_corrections': []
                 },
                 'error': str(e)
-            } 
+            }
+
+    def count_sections(self, data):
+        """Recursively count sections in the structure"""
+        if not data:
+            return 0
+        
+        count = 0
+        # Check if current node is a section
+        if data.get('type') == 'section':
+            count += 1
+        
+        # Recursively count sections in children
+        for child in data.get('children', []):
+            count += self.count_sections(child)
+        
+        return count
+
+    def count_parts(self, data):
+        """Recursively count parts in the structure"""
+        if not data:
+            return 0
+        
+        count = 0
+        # Check if current node is a part
+        if data.get('type') == 'part':
+            count += 1
+        
+        # Recursively count parts in children
+        for child in data.get('children', []):
+            count += self.count_parts(child)
+        
+        return count 
