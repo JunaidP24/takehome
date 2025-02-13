@@ -286,6 +286,7 @@ class ECFRService:
             # Split content into sections
             sections = re.split(r'(?=\n*§\s*\d+\.)', content)
             print(f"Processing {len(sections)} sections")
+            print(f"Sections: {sections}")
             
             total_words = len(re.findall(r'\b\w+\b', content))
             print(f"Total words in content: {total_words}")
@@ -359,6 +360,8 @@ class ECFRService:
                 return {'dates': [], 'section_counts': [], 'part_counts': []}
             
             versions_data = versions_response.json()
+
+            print(f"Versions data: {versions_data}")
             
             # Find the title's version history
             title_info = next(
@@ -517,7 +520,7 @@ class ECFRService:
                             'date': c.get('correction_date'),
                             'description': c.get('correction_text')
                         }
-                        for c in (corrections if isinstance(corrections, list) else [])[:5]
+                        for c in (corrections if isinstance(corrections, list) else [])[:10]
                     ]
                 }
             }
