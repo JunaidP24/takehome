@@ -8,6 +8,7 @@ import {
   CircularProgress,
   Alert
 } from '@mui/material';
+import { fetchApi } from '../api/api';
 import TitleAnalysis from './TitleAnalysis';
 
 function TitlesOverview() {
@@ -17,11 +18,7 @@ function TitlesOverview() {
     queryKey: ['titles'],
     queryFn: async () => {
       try {
-        const response = await fetch('/api/titles');
-        if (!response.ok) {
-          throw new Error(`API error: ${response.status}`);
-        }
-        const data = await response.json();
+        const data = await fetchApi('/api/titles');
         return data.titles; // Extract the titles array
       } catch (err) {
         console.error('Fetch error:', err);

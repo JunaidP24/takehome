@@ -1,5 +1,6 @@
 import React, { useState } from 'react';
 import { useQuery } from '@tanstack/react-query';
+import { fetchApi } from '../api/api';
 import { 
   Dialog,
   DialogTitle,
@@ -81,11 +82,7 @@ function TitleAnalysis({ titleNumber, onClose }) {
   const { data: analysis, isLoading, error } = useQuery({
     queryKey: ['titleAnalysis', titleNumber],
     queryFn: async () => {
-      const response = await fetch(`/api/titles/${titleNumber}/analysis`);
-      if (!response.ok) {
-        throw new Error('Network response was not ok');
-      }
-      return response.json();
+      return fetchApi(`/api/titles/${titleNumber}/analysis`);
     }
   });
 
